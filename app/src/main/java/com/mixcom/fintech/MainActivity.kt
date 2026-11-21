@@ -19,7 +19,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
@@ -38,6 +37,20 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+
+// === உங்கள் Supabase விவரங்களை இங்கே மாற்றவும் ===
+const val SUPABASE_URL = "https://bwowvsrcehixusbkhctv.supabase.co"
+const val SUPABASE_ANON_KEY = "sb_publishable_ohZfbMRrAR2GwR-GtytDhA_WZ0ZknTK"
+const val AGENT_USER_ID = "MIXCOM_AGENT_01"
 
 val RoyalBlue = Color(0xFF1D3587)
 val DeepBlue = Color(0xFF0E236B)
@@ -63,6 +76,7 @@ data class ServiceItem(
     val title: String,
     val icon: ImageVector,
     val provider: String,
+    val category: String = "Wallet",
     val badge: String? = null,
     val badgeColor: Color = BadgeYellow
 )
@@ -77,11 +91,121 @@ data class TxnItem(
     val isCredit: Boolean
 )
 
+object SupabaseClient {
+    private val client = OkHttpClient()
+    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+    private fun baseRequest(endpoint: String): Request.Builder {
+        return Request.Builder()
+            .url("$SUPABASE_URL/rest/v1/$endpoint")
+            .addHeader("apikey", SUPABASE_ANON_KEY)
+            .addHeader("Authorization", "Bearer $SUPABASE_ANON_KEY")
+            .addHeader("Content-Type", "application/json")
+    }
+
+    suspend fun fetchWalletBalance(): Double? = withContext(Dispatchers.IO) {
+        try {
+            val req = baseRequest("wallets?user_id=eq.$AGENT_USER_ID&select=balance").get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext null
+                val body = resp.body?.string() ?: return@withContext null
+                val arr = JSONArray(body)
+                if (arr.length() > 0) arr.getJSONObject(0).optDouble("balance", 78.0) else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    suspend fun updateWalletBalance(newBalance: Double): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val payload = JSONObject().put("balance", newBalance).toString()
+            val req = baseRequest("wallets?user_id=eq.$AGENT_USER_ID")
+                .patch(payload.toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(req).execute().use { it.isSuccessful }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    suspend fun fetchTransactions(): List<TxnItem>? = withContext(Dispatchers.IO) {
+        try {
+            val req = baseRequest("transactions?user_id=eq.$AGENT_USER_ID&order=created_at.desc&limit=30").get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext null
+                val body = resp.body?.string() ?: return@withContext null
+                val arr = JSONArray(body)
+                val list = mutableListOf<TxnItem>()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    val amt = obj.optDouble("amount", 0.0)
+                    val balAfter = obj.optDouble("balance_after", 0.0)
+                    val isCredit = obj.optBoolean("is_credit", false)
+                    val prefix = if (isCredit) "+ Rs" else "- Rs"
+                    list.add(
+                        TxnItem(
+                            id = obj.optString("trans_id", "000000"),
+                            date = obj.optString("created_at", "").take(16).replace("T", " | "),
+                            title = obj.optString("title", ""),
+                            subtitle = obj.optString("subtitle", ""),
+                            amount = "$prefix ${"%.2f".format(amt)}",
+                            balance = "Balance Rs ${"%.2f".format(balAfter)}",
+                            isCredit = isCredit
+                        )
+                    )
+                }
+                list
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    suspend fun insertTransaction(
+        transId: String,
+        category: String,
+        provider: String,
+        title: String,
+        subtitle: String,
+        amount: Double,
+        balanceAfter: Double,
+        isCredit: Boolean
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val payload = JSONObject()
+                .put("trans_id", transId)
+                .put("user_id", AGENT_USER_ID)
+                .put("service_category", category)
+                .put("api_provider", provider)
+                .put("title", title)
+                .put("subtitle", subtitle)
+                .put("amount", amount)
+                .put("balance_after", balanceAfter)
+                .put("is_credit", isCredit)
+                .toString()
+
+            val req = baseRequest("transactions")
+                .addHeader("Prefer", "return=minimal")
+                .post(payload.toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(req).execute().use { it.isSuccessful }
+        } catch (_: Exception) {
+            false
+        }
+    }
+}
+
 @Composable
 fun FintechMainApp() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
     var selectedTab by remember { mutableIntStateOf(0) }
     var activeService by remember { mutableStateOf<ServiceItem?>(null) }
     var walletBalance by remember { mutableDoubleStateOf(78.00) }
+    var isSyncing by remember { mutableStateOf(false) }
+
     val txnList = remember {
         mutableStateListOf(
             TxnItem("31793865614910", "05-Nov-2026 | 01:30 PM", "Wallet | Refund", "GST Amount Refunded", "+ Rs 0.76", "Balance Rs 77.50", true),
@@ -90,7 +214,29 @@ fun FintechMainApp() {
         )
     }
 
-    // Back button handler when inside a service screen
+    fun syncFromSupabase(showToast: Boolean = false) {
+        scope.launch {
+            isSyncing = true
+            val dbBalance = SupabaseClient.fetchWalletBalance()
+            val dbTxns = SupabaseClient.fetchTransactions()
+            if (dbBalance != null) {
+                walletBalance = dbBalance
+            }
+            if (dbTxns != null && dbTxns.isNotEmpty()) {
+                txnList.clear()
+                txnList.addAll(dbTxns)
+            }
+            isSyncing = false
+            if (showToast) {
+                Toast.makeText(context, if (dbBalance != null) "Synced with Supabase!" else "Check Supabase URL/Key", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        syncFromSupabase(showToast = false)
+    }
+
     BackHandler(enabled = activeService != null) {
         activeService = null
     }
@@ -100,23 +246,40 @@ fun FintechMainApp() {
             service = activeService!!,
             currentBalance = walletBalance,
             onBack = { activeService = null },
-            onTransactionSuccess = { title, sub, amt, isCredit ->
-                if (isCredit) walletBalance += amt else walletBalance -= amt
+            onTransactionSuccess = { srv, title, sub, amt, isCredit ->
+                val newBal = if (isCredit) walletBalance + amt else walletBalance - amt
+                val transId = (10000000000000..99999999999999).random().toString()
                 val prefix = if (isCredit) "+ Rs" else "- Rs"
+
+                walletBalance = newBal
                 txnList.add(
                     0,
                     TxnItem(
-                        id = (10000000000000..99999999999999).random().toString(),
-                        date = "21-Nov-2026 | Just now",
+                        id = transId,
+                        date = "Just now",
                         title = title,
                         subtitle = sub,
                         amount = "$prefix ${"%.2f".format(amt)}",
-                        balance = "Balance Rs ${"%.2f".format(walletBalance)}",
+                        balance = "Balance Rs ${"%.2f".format(newBal)}",
                         isCredit = isCredit
                     )
                 )
                 activeService = null
-                selectedTab = 1 // Redirect to History tab to see result
+                selectedTab = 1
+
+                scope.launch {
+                    SupabaseClient.updateWalletBalance(newBal)
+                    SupabaseClient.insertTransaction(
+                        transId = transId,
+                        category = srv.category,
+                        provider = srv.provider,
+                        title = title,
+                        subtitle = sub,
+                        amount = amt,
+                        balanceAfter = newBal,
+                        isCredit = isCredit
+                    )
+                }
             }
         )
         return
@@ -173,6 +336,8 @@ fun FintechMainApp() {
             when (selectedTab) {
                 0 -> ServicesHomeScreen(
                     walletBalance = walletBalance,
+                    isSyncing = isSyncing,
+                    onRefresh = { syncFromSupabase(showToast = true) },
                     onServiceClick = { service -> activeService = service }
                 )
                 1 -> HistoryScreen(txns = txnList, onBack = { selectedTab = 0 })
@@ -184,30 +349,35 @@ fun FintechMainApp() {
 }
 
 @Composable
-fun ServicesHomeScreen(walletBalance: Double, onServiceClick: (ServiceItem) -> Unit) {
+fun ServicesHomeScreen(
+    walletBalance: Double,
+    isSyncing: Boolean,
+    onRefresh: () -> Unit,
+    onServiceClick: (ServiceItem) -> Unit
+) {
     var showBalance by remember { mutableStateOf(true) }
 
     val bankingServices = listOf(
-        ServiceItem("aeps_withdraw", "Cash Withdraw", Icons.Outlined.AccountBalanceWallet, "EKO"),
-        ServiceItem("aeps_mini", "Mini Statement", Icons.Outlined.Description, "EKO"),
-        ServiceItem("aeps_balance", "Balance Enquiry", Icons.Outlined.Savings, "EKO"),
-        ServiceItem("dmt", "Money Transfer", Icons.Outlined.SwapHoriz, "EKO"),
-        ServiceItem("buy_gold", "Digital Gold", Icons.Outlined.Diamond, "OROPOCKET", "24K LIVE", BadgeYellow),
-        ServiceItem("sell_gold", "Sell Gold", Icons.Outlined.MonetizationOn, "OROPOCKET", "INSTANT", BadgeGreen),
-        ServiceItem("upi_cash", "UPI Cash Point", Icons.Outlined.QrCode2, "EKO", "NEW", BadgeGreen),
-        ServiceItem("matm", "Micro ATM", Icons.Outlined.PointOfSale, "EKO"),
-        ServiceItem("credit_card", "Credit Cards", Icons.Outlined.CreditCard, "EKO", "FREE", BadgeYellow)
+        ServiceItem("aeps_withdraw", "Cash Withdraw", Icons.Outlined.AccountBalanceWallet, "EKO", "AEPS"),
+        ServiceItem("aeps_mini", "Mini Statement", Icons.Outlined.Description, "EKO", "AEPS"),
+        ServiceItem("aeps_balance", "Balance Enquiry", Icons.Outlined.Savings, "EKO", "AEPS"),
+        ServiceItem("dmt", "Money Transfer", Icons.Outlined.SwapHoriz, "EKO", "DMT"),
+        ServiceItem("buy_gold", "Digital Gold", Icons.Outlined.Diamond, "OROPOCKET", "GOLD", "24K LIVE", BadgeYellow),
+        ServiceItem("sell_gold", "Sell Gold", Icons.Outlined.MonetizationOn, "OROPOCKET", "GOLD", "INSTANT", BadgeGreen),
+        ServiceItem("upi_cash", "UPI Cash Point", Icons.Outlined.QrCode2, "EKO", "Wallet", "NEW", BadgeGreen),
+        ServiceItem("matm", "Micro ATM", Icons.Outlined.PointOfSale, "EKO", "AEPS"),
+        ServiceItem("credit_card", "Credit Cards", Icons.Outlined.CreditCard, "EKO", "Wallet", "FREE", BadgeYellow)
     )
 
     val billsServices = listOf(
-        ServiceItem("mobile_prepaid", "Mobile Prepaid", Icons.Outlined.Smartphone, "EKO", "Upto 2%"),
-        ServiceItem("loan_repay", "Loan Repayment", Icons.Outlined.RequestQuote, "EKO", "Flat 0.15%"),
-        ServiceItem("electricity", "Electricity", Icons.Outlined.Lightbulb, "EKO", "Flat ₹1"),
-        ServiceItem("dth", "DTH", Icons.Outlined.SettingsInputAntenna, "EKO", "Upto 1.50%"),
-        ServiceItem("agent_coll", "Agent Collection", Icons.Outlined.Storefront, "EKO", "Flat 0.11%"),
-        ServiceItem("cc_bill", "Credit Card Bill", Icons.Outlined.CreditScore, "EKO", "Flat ₹0.5"),
-        ServiceItem("fastag", "FASTag", Icons.Outlined.DirectionsCar, "EKO", "Flat 0.15%"),
-        ServiceItem("postpaid", "Mobile Postpaid", Icons.Outlined.PhoneAndroid, "EKO")
+        ServiceItem("mobile_prepaid", "Mobile Prepaid", Icons.Outlined.Smartphone, "EKO", "Recharge", "Upto 2%"),
+        ServiceItem("loan_repay", "Loan Repayment", Icons.Outlined.RequestQuote, "EKO", "Recharge", "Flat 0.15%"),
+        ServiceItem("electricity", "Electricity", Icons.Outlined.Lightbulb, "EKO", "Recharge", "Flat ₹1"),
+        ServiceItem("dth", "DTH", Icons.Outlined.SettingsInputAntenna, "EKO", "Recharge", "Upto 1.50%"),
+        ServiceItem("agent_coll", "Agent Collection", Icons.Outlined.Storefront, "EKO", "Wallet", "Flat 0.11%"),
+        ServiceItem("cc_bill", "Credit Card Bill", Icons.Outlined.CreditScore, "EKO", "Recharge", "Flat ₹0.5"),
+        ServiceItem("fastag", "FASTag", Icons.Outlined.DirectionsCar, "EKO", "Recharge", "Flat 0.15%"),
+        ServiceItem("postpaid", "Mobile Postpaid", Icons.Outlined.PhoneAndroid, "EKO", "Recharge")
     )
 
     LazyColumn(modifier = Modifier.fillMaxSize()) {
@@ -231,7 +401,11 @@ fun ServicesHomeScreen(walletBalance: Double, onServiceClick: (ServiceItem) -> U
                                 fontSize = 24.sp,
                                 fontWeight = FontWeight.Bold
                             )
-                            Text("Wallet Balance", color = Color.White.copy(alpha = 0.85f), fontSize = 12.sp)
+                            Text(
+                                if (isSyncing) "Syncing Supabase..." else "Wallet Balance (Live)",
+                                color = Color.White.copy(alpha = 0.85f),
+                                fontSize = 12.sp
+                            )
                         }
                         Spacer(Modifier.width(12.dp))
                         IconButton(
@@ -250,7 +424,7 @@ fun ServicesHomeScreen(walletBalance: Double, onServiceClick: (ServiceItem) -> U
                         Spacer(Modifier.width(8.dp))
                         IconButton(
                             onClick = {
-                                onServiceClick(ServiceItem("add_wallet", "Add Money to Wallet", Icons.Outlined.AddCard, "WALLET"))
+                                onServiceClick(ServiceItem("add_wallet", "Add Money to Wallet", Icons.Outlined.AddCard, "WALLET", "Wallet"))
                             },
                             modifier = Modifier
                                 .size(38.dp)
@@ -260,25 +434,24 @@ fun ServicesHomeScreen(walletBalance: Double, onServiceClick: (ServiceItem) -> U
                         }
                     }
                     IconButton(
-                        onClick = {},
+                        onClick = onRefresh,
                         modifier = Modifier
                             .size(40.dp)
                             .border(1.dp, Color.White.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
                     ) {
-                        Icon(Icons.Outlined.Notifications, contentDescription = "Alerts", tint = Color.White)
+                        Icon(Icons.Outlined.Refresh, contentDescription = "Refresh Supabase", tint = Color.White)
                     }
                 }
 
                 Spacer(Modifier.height(16.dp))
 
-                // Gold & Loan Promo Banner
                 Card(
                     shape = RoundedCornerShape(14.dp),
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF0A3A9C)),
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable {
-                            onServiceClick(ServiceItem("buy_gold", "Digital Gold", Icons.Outlined.Diamond, "OROPOCKET"))
+                            onServiceClick(ServiceItem("buy_gold", "Digital Gold", Icons.Outlined.Diamond, "OROPOCKET", "GOLD"))
                         }
                 ) {
                     Row(
@@ -328,42 +501,6 @@ fun ServicesHomeScreen(walletBalance: Double, onServiceClick: (ServiceItem) -> U
                 onServiceClick = onServiceClick
             )
         }
-
-        item {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Card(
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White)
-                ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
-                        Text("Accept Payments", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                        Spacer(Modifier.height(14.dp))
-                        ServiceIconBox(ServiceItem("mpos", "MPOS+", Icons.Outlined.PointOfSale, "EKO"), onServiceClick)
-                    }
-                }
-                Card(
-                    modifier = Modifier.weight(1.3f),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White)
-                ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
-                        Text("Govt. Services", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                        Spacer(Modifier.height(14.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            ServiceIconBox(ServiceItem("pan_apply", "Apply PAN", Icons.Outlined.Badge, "EKO"), onServiceClick)
-                            ServiceIconBox(ServiceItem("epan", "Activate ePAN", Icons.Outlined.ContactPage, "EKO", "Instant"), onServiceClick)
-                        }
-                    }
-                }
-            }
-            Spacer(Modifier.height(16.dp))
-        }
     }
 }
 
@@ -372,13 +509,12 @@ fun ServiceActionRouter(
     service: ServiceItem,
     currentBalance: Double,
     onBack: () -> Unit,
-    onTransactionSuccess: (String, String, Double, Boolean) -> Unit
+    onTransactionSuccess: (ServiceItem, String, String, Double, Boolean) -> Unit
 ) {
     val context = LocalContext.current
     var field1 by remember { mutableStateOf("") }
     var field2 by remember { mutableStateOf("") }
     var amountStr by remember { mutableStateOf("") }
-    var selectedOption by remember { mutableStateOf("State Bank of India") }
 
     Scaffold(
         topBar = {
@@ -419,38 +555,21 @@ fun ServiceActionRouter(
                     when {
                         service.provider == "OROPOCKET" -> {
                             Text("Oropocket 24K Gold (99.9% Purity)", fontWeight = FontWeight.Bold, color = RoyalBlue)
-                            Text("Live Buy Price: ₹7,850.00 / gram", fontSize = 13.sp, color = Color(0xFF2E7D32))
                             OutlinedTextField(
                                 value = amountStr,
                                 onValueChange = { amountStr = it },
-                                label = { Text("Enter Amount in ₹ (Min ₹10)") },
+                                label = { Text("Enter Amount in ₹") },
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                 modifier = Modifier.fillMaxWidth()
                             )
-                            val grams = (amountStr.toDoubleOrNull() ?: 0.0) / 7850.0
-                            Text("Estimated Gold Weight: ${"%.4f".format(grams)} grams", fontWeight = FontWeight.SemiBold)
                         }
-
-                        service.id.startsWith("aeps") -> {
-                            Text("Eko AePS Biometric Service", fontWeight = FontWeight.Bold, color = RoyalBlue)
+                        service.category == "AEPS" -> {
+                            Text("Eko AePS Service", fontWeight = FontWeight.Bold, color = RoyalBlue)
                             OutlinedTextField(
                                 value = field1,
                                 onValueChange = { if (it.length <= 12) field1 = it },
-                                label = { Text("Customer 12-Digit Aadhaar Number") },
+                                label = { Text("12-Digit Aadhaar Number") },
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            OutlinedTextField(
-                                value = field2,
-                                onValueChange = { if (it.length <= 10) field2 = it },
-                                label = { Text("Customer Mobile Number") },
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            OutlinedTextField(
-                                value = selectedOption,
-                                onValueChange = { selectedOption = it },
-                                label = { Text("Bank Name") },
                                 modifier = Modifier.fillMaxWidth()
                             )
                             if (service.id == "aeps_withdraw") {
@@ -463,20 +582,13 @@ fun ServiceActionRouter(
                                 )
                             }
                         }
-
-                        service.id == "dmt" -> {
-                            Text("Eko Direct Money Transfer (IMPS/NEFT)", fontWeight = FontWeight.Bold, color = RoyalBlue)
+                        service.category == "DMT" -> {
+                            Text("Eko Money Transfer (DMT)", fontWeight = FontWeight.Bold, color = RoyalBlue)
                             OutlinedTextField(
                                 value = field1,
                                 onValueChange = { field1 = it },
-                                label = { Text("Beneficiary Bank Account Number") },
+                                label = { Text("Beneficiary Account Number") },
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            OutlinedTextField(
-                                value = field2,
-                                onValueChange = { field2 = it.uppercase() },
-                                label = { Text("IFSC Code (e.g. CIUB0000001)") },
                                 modifier = Modifier.fillMaxWidth()
                             )
                             OutlinedTextField(
@@ -487,49 +599,39 @@ fun ServiceActionRouter(
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
-
                         service.id == "add_wallet" -> {
-                            Text("Instant Wallet Top-up", fontWeight = FontWeight.Bold, color = RoyalBlue)
+                            Text("Add Money to Wallet", fontWeight = FontWeight.Bold, color = RoyalBlue)
                             OutlinedTextField(
                                 value = amountStr,
                                 onValueChange = { amountStr = it },
-                                label = { Text("Enter Amount to Add (₹)") },
+                                label = { Text("Amount (₹)") },
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
-
                         else -> {
-                            Text("Eko BBPS & Recharge Service", fontWeight = FontWeight.Bold, color = RoyalBlue)
+                            Text("Eko Recharge & Bill Payment", fontWeight = FontWeight.Bold, color = RoyalBlue)
                             OutlinedTextField(
                                 value = field1,
                                 onValueChange = { field1 = it },
-                                label = { Text("Mobile Number / Consumer ID / Vehicle No") },
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            OutlinedTextField(
-                                value = field2,
-                                onValueChange = { field2 = it },
-                                label = { Text("Operator / Biller Name (e.g. Jio, Airtel, TANGEDCO)") },
+                                label = { Text("Mobile / Consumer Number") },
                                 modifier = Modifier.fillMaxWidth()
                             )
                             OutlinedTextField(
                                 value = amountStr,
                                 onValueChange = { amountStr = it },
-                                label = { Text("Bill / Recharge Amount (₹)") },
+                                label = { Text("Amount (₹)") },
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
                     }
 
-                    Spacer(Modifier.height(8.dp))
-
                     Button(
                         onClick = {
                             val amt = amountStr.toDoubleOrNull() ?: 0.0
                             if (service.id != "aeps_mini" && service.id != "aeps_balance" && amt <= 0) {
-                                Toast.makeText(context, "Please enter a valid amount", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Enter valid amount", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
                             val isCredit = (service.id == "add_wallet" || service.id == "aeps_withdraw" || service.id == "sell_gold")
@@ -537,25 +639,19 @@ fun ServiceActionRouter(
                                 Toast.makeText(context, "Insufficient Wallet Balance!", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
-                            Toast.makeText(context, "${service.title} Request Submitted via ${service.provider}", Toast.LENGTH_SHORT).show()
                             onTransactionSuccess(
+                                service,
                                 "${service.title} | ${service.provider}",
-                                if (field1.isNotEmpty()) "Ref: $field1" else "Processed Successfully",
+                                if (field1.isNotEmpty()) "Ref: $field1" else "Saved to Supabase",
                                 amt,
                                 isCredit
                             )
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = BrandRed),
                         shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp)
+                        modifier = Modifier.fillMaxWidth().height(50.dp)
                     ) {
-                        Text(
-                            text = if (service.id.startsWith("aeps")) "Capture Fingerprint & Proceed" else "Proceed & Pay",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 16.sp
-                        )
+                        Text("Proceed & Save", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     }
                 }
             }
@@ -572,9 +668,7 @@ fun ServiceGridCard(
     onServiceClick: (ServiceItem) -> Unit
 ) {
     Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 14.dp, vertical = 8.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(2.dp)
@@ -585,15 +679,13 @@ fun ServiceGridCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(title, fontWeight = FontWeight.Bold, fontSize = 17.sp, color = Color(0xFF1A1A1A))
+                Text(title, fontWeight = FontWeight.Bold, fontSize = 17.sp)
                 Text(tag, fontWeight = FontWeight.Bold, fontSize = 12.sp, color = RoyalBlue)
             }
             Spacer(Modifier.height(14.dp))
             items.chunked(columns).forEach { rowItems ->
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 8.dp),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                     horizontalArrangement = Arrangement.SpaceAround
                 ) {
                     rowItems.forEach { item ->
@@ -636,8 +728,7 @@ fun ServiceIconBox(item: ServiceItem, onClick: (ServiceItem) -> Unit) {
             item.title,
             fontSize = 11.sp,
             textAlign = TextAlign.Center,
-            lineHeight = 14.sp,
-            color = Color(0xFF222222)
+            lineHeight = 14.sp
         )
     }
 }
@@ -647,92 +738,59 @@ fun HistoryScreen(txns: List<TxnItem>, onBack: () -> Unit) {
     var selectedFilter by remember { mutableStateOf("Wallet") }
     val tabs = listOf("Wallet", "AEPS", "DMT", "Recharge", "GOLD")
 
-    Scaffold(
-        floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = {},
-                containerColor = RoyalBlue,
-                contentColor = Color.White,
-                shape = CircleShape
-            ) {
-                Icon(Icons.Filled.AccountBalanceWallet, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text("Summary", fontWeight = FontWeight.Bold)
-            }
-        }
-    ) { pad ->
-        Column(modifier = Modifier.padding(pad).fillMaxSize().background(Color.White)) {
-            Column(modifier = Modifier.background(RoyalBlue)) {
-                Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
-                    }
-                    Text("History", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+    Column(modifier = Modifier.fillMaxSize().background(Color.White)) {
+        Column(modifier = Modifier.background(RoyalBlue)) {
+            Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
                 }
-                LazyRow(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
-                    items(tabs) { tab ->
-                        Column(
-                            modifier = Modifier
-                                .clickable { selectedFilter = tab }
-                                .padding(horizontal = 14.dp, vertical = 8.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(
-                                tab,
-                                color = if (selectedFilter == tab) Color.White else Color.White.copy(alpha = 0.7f),
-                                fontWeight = FontWeight.Bold
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            if (selectedFilter == tab) {
-                                Box(Modifier.width(40.dp).height(3.dp).background(BrandRed))
-                            }
+                Text("History (Supabase)", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            }
+            LazyRow(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+                items(tabs) { tab ->
+                    Column(
+                        modifier = Modifier
+                            .clickable { selectedFilter = tab }
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            tab,
+                            color = if (selectedFilter == tab) Color.White else Color.White.copy(alpha = 0.7f),
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        if (selectedFilter == tab) {
+                            Box(Modifier.width(40.dp).height(3.dp).background(BrandRed))
                         }
                     }
                 }
             }
+        }
 
-            LazyColumn {
-                items(txns) { txn ->
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column {
-                                Text("Trans ID: ${txn.id}", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                Text(txn.date, color = Color.Gray, fontSize = 11.sp)
-                            }
-                            Column(horizontalAlignment = Alignment.End) {
-                                Text(
-                                    txn.amount,
-                                    color = if (txn.isCredit) Color(0xFF2E7D32) else BrandRed,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 14.sp
-                                )
-                                Text(txn.balance, color = Color(0xFF2E7D32), fontSize = 11.sp)
-                            }
+        LazyColumn {
+            items(txns) { txn ->
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column {
+                            Text("Trans ID: ${txn.id}", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text(txn.date, color = Color.Gray, fontSize = 11.sp)
                         }
-                        Spacer(Modifier.height(10.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                modifier = Modifier.size(40.dp).border(1.dp, Color.LightGray, CircleShape),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text("₹", color = BrandRed, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(txn.title, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                                Text(txn.subtitle, color = Color.Gray, fontSize = 12.sp)
-                            }
-                            Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Color.Gray)
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(
+                                txn.amount,
+                                color = if (txn.isCredit) Color(0xFF2E7D32) else BrandRed,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                            Text(txn.balance, color = Color(0xFF2E7D32), fontSize = 11.sp)
                         }
                     }
-                    HorizontalDivider(color = Color(0xFFEEEEEE))
+                    Spacer(Modifier.height(8.dp))
+                    Text(txn.title, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(txn.subtitle, color = Color.Gray, fontSize = 12.sp)
                 }
+                HorizontalDivider(color = Color(0xFFEEEEEE))
             }
         }
     }
@@ -740,90 +798,19 @@ fun HistoryScreen(txns: List<TxnItem>, onBack: () -> Unit) {
 
 @Composable
 fun AccountShopScreen(onActionClick: (ServiceItem) -> Unit) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().background(Color.White),
+    Column(
+        modifier = Modifier.fillMaxSize().background(Color.White).padding(20.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        item {
-            Box(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                Icon(
-                    Icons.Outlined.Settings,
-                    contentDescription = "Settings",
-                    modifier = Modifier.align(Alignment.TopEnd).size(26.dp)
-                )
-                Column(
-                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Surface(
-                        color = RoyalBlue,
-                        shape = RoundedCornerShape(topStart = 8.dp, topEnd = 8.dp),
-                        modifier = Modifier.width(230.dp)
-                    ) {
-                        Text(
-                            "MiXCOM Fintech",
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(vertical = 6.dp)
-                        )
-                    }
-                    Canvas(modifier = Modifier.width(250.dp).height(45.dp)) {
-                        val stripes = 12
-                        val stripeW = size.width / stripes
-                        for (i in 0 until stripes) {
-                            drawRect(
-                                color = if (i % 2 == 0) BrandRed else Color(0xFFF2F2F2),
-                                topLeft = Offset(i * stripeW, 0f),
-                                size = Size(stripeW, size.height)
-                            )
-                        }
-                    }
-                    Spacer(Modifier.height(10.dp))
-                    Surface(color = VipGold, shape = RoundedCornerShape(6.dp)) {
-                        Text(
-                            "VIP",
-                            fontWeight = FontWeight.ExtraBold,
-                            color = Color.Black,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
-                        )
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    Text("Powered by Kabeer Ahamed", color = Color.DarkGray, fontSize = 13.sp)
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
-                val shopActions = listOf(
-                    Triple("Manage\nWallet", Icons.Outlined.AccountBalanceWallet, ServiceItem("add_wallet", "Add Money to Wallet", Icons.Outlined.AddCard, "WALLET")),
-                    Triple("Bank\nSettlement", Icons.Outlined.AccountBalance, ServiceItem("dmt", "Bank Settlement", Icons.Outlined.AccountBalance, "EKO")),
-                    Triple("Buy\nGold", Icons.Outlined.Diamond, ServiceItem("buy_gold", "Digital Gold", Icons.Outlined.Diamond, "OROPOCKET")),
-                    Triple("My\nEarnings", Icons.Outlined.Savings, ServiceItem("aeps_balance", "Balance Enquiry", Icons.Outlined.Savings, "EKO"))
-                )
-                shopActions.forEach { (label, icon, srv) ->
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.clickable { onActionClick(srv) }
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(14.dp),
-                            border = BorderStroke(1.dp, Color(0xFFE0E0E0)),
-                            color = Color.White,
-                            modifier = Modifier.size(56.dp)
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(icon, contentDescription = label, tint = BrandRed, modifier = Modifier.size(26.dp))
-                            }
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        Text(label, fontSize = 12.sp, textAlign = TextAlign.Center, lineHeight = 15.sp)
-                    }
-                }
-            }
+        Surface(color = RoyalBlue, shape = RoundedCornerShape(8.dp)) {
+            Text("MiXCOM Fintech", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
         }
+        Spacer(Modifier.height(10.dp))
+        Surface(color = VipGold, shape = RoundedCornerShape(6.dp)) {
+            Text("VIP", fontWeight = FontWeight.ExtraBold, color = Color.Black, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp))
+        }
+        Spacer(Modifier.height(8.dp))
+        Text("Agent ID: $AGENT_USER_ID", color = Color.DarkGray, fontSize = 13.sp)
     }
 }
 
@@ -832,12 +819,6 @@ fun HelpScreen() {
     Column(modifier = Modifier.fillMaxSize().padding(20.dp)) {
         Text("Help & Support", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = RoyalBlue)
         Spacer(Modifier.height(12.dp))
-        Card(colors = CardDefaults.cardColors(containerColor = Color.White), modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text("24x7 Merchant Support", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Spacer(Modifier.height(6.dp))
-                Text("Connected APIs: Eko India Financial Services & Oropocket Digital Gold.", color = Color.Gray, fontSize = 13.sp)
-            }
-        }
+        Text("Providers: Eko (Banking/Recharge) & Oropocket (Digital Gold)", color = Color.DarkGray)
     }
 }
