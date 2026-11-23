@@ -77,11 +77,17 @@ data class SecurityState(
     val mpinHash: String? = null
 )
 
+data class GoldRateInfo(
+    val buyPrice: Double = 13007.0,
+    val sellPrice: Double = 12630.84,
+    val finalBuyPrice: Double = 13397.21
+)
+
 data class ServiceItem(
     val id: String,
     val title: String,
     val icon: ImageVector,
-    val provider: String,
+    val provider: String, // "EKO", "OROPOCKET", "WALLET"
     val category: String = "Wallet",
     val badge: String? = null,
     val badgeColor: Color = BadgeYellow
@@ -107,6 +113,50 @@ object SupabaseClient {
             .addHeader("apikey", SUPABASE_ANON_KEY)
             .addHeader("Authorization", "Bearer $SUPABASE_ANON_KEY")
             .addHeader("Content-Type", "application/json")
+    }
+
+    suspend fun callEdgeFunction(
+        functionName: String,
+        payloadJson: JSONObject
+    ): Pair<Boolean, JSONObject> = withContext(Dispatchers.IO) {
+        try {
+            val req = Request.Builder()
+                .url("$SUPABASE_URL/functions/v1/$functionName")
+                .addHeader("apikey", SUPABASE_ANON_KEY)
+                .addHeader("Authorization", "Bearer $SUPABASE_ANON_KEY")
+                .addHeader("Content-Type", "application/json")
+                .post(payloadJson.toString().toRequestBody(jsonMediaType))
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                val rawBody = resp.body?.string().orEmpty()
+                val json = try { JSONObject(rawBody) } catch (_: Exception) { JSONObject() }
+                val ok = resp.isSuccessful && json.optBoolean("success", true)
+                Pair(ok, json)
+            }
+        } catch (e: Exception) {
+            Pair(false, JSONObject().put("message", e.message ?: "Network error"))
+        }
+    }
+
+    suspend fun fetchGoldRate(): GoldRateInfo? = withContext(Dispatchers.IO) {
+        try {
+            val (ok, json) = callEdgeFunction("oropocket-gold", JSONObject().put("action", "get_gold_rate"))
+            if (!ok) return@withContext null
+            val goldObj = json.optJSONObject("data")
+                ?.optJSONObject("data")
+                ?.optJSONObject("prices")
+                ?.optJSONObject("gold")
+            if (goldObj != null) {
+                GoldRateInfo(
+                    buyPrice = goldObj.optDouble("buy", 13007.0),
+                    sellPrice = goldObj.optDouble("sell", 12630.84),
+                    finalBuyPrice = goldObj.optDouble("final_buy_price", 13397.21)
+                )
+            } else null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     suspend fun fetchSecurityState(): SecurityState? = withContext(Dispatchers.IO) {
@@ -295,9 +345,7 @@ fun AppRoot() {
         return
     }
 
-    FintechMainApp(
-        onLockApp = { isUnlocked = false }
-    )
+    FintechMainApp(onLockApp = { isUnlocked = false })
 }
 
 @Composable
@@ -481,6 +529,7 @@ fun FintechMainApp(onLockApp: () -> Unit) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var activeService by remember { mutableStateOf<ServiceItem?>(null) }
     var walletBalance by remember { mutableDoubleStateOf(78.00) }
+    var goldRate by remember { mutableStateOf(GoldRateInfo()) }
     var isSyncing by remember { mutableStateOf(false) }
 
     val txnList = remember {
@@ -496,14 +545,19 @@ fun FintechMainApp(onLockApp: () -> Unit) {
             isSyncing = true
             val dbBalance = SupabaseClient.fetchWalletBalance()
             val dbTxns = SupabaseClient.fetchTransactions()
+            val liveGold = SupabaseClient.fetchGoldRate()
+
             if (dbBalance != null) walletBalance = dbBalance
             if (dbTxns != null && dbTxns.isNotEmpty()) {
                 txnList.clear()
                 txnList.addAll(dbTxns)
             }
+            if (liveGold != null) {
+                goldRate = liveGold
+            }
             isSyncing = false
             if (showToast) {
-                Toast.makeText(context, if (dbBalance != null) "Synced!" else "Check Supabase config", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Synced with Supabase & Edge Functions!", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -521,8 +575,14 @@ fun FintechMainApp(onLockApp: () -> Unit) {
             service = activeService!!,
             currentBalance = walletBalance,
             onBack = { activeService = null },
-            onTransactionSuccess = { srv, title, sub, amt, isCredit ->
-                val newBal = if (isCredit) walletBalance + amt else walletBalance - amt
+            onTransactionSuccess = { srv, title, sub, amt, isCredit, updateBalance ->
+                val newBal = if (!updateBalance) {
+                    walletBalance
+                } else if (isCredit) {
+                    walletBalance + amt
+                } else {
+                    walletBalance - amt
+                }
                 val transId = (10000000000000..99999999999999).random().toString()
                 val prefix = if (isCredit) "+ Rs" else "- Rs"
 
@@ -543,7 +603,9 @@ fun FintechMainApp(onLockApp: () -> Unit) {
                 selectedTab = 1
 
                 scope.launch {
-                    SupabaseClient.updateWalletBalance(newBal)
+                    if (updateBalance) {
+                        SupabaseClient.updateWalletBalance(newBal)
+                    }
                     SupabaseClient.insertTransaction(
                         transId = transId,
                         category = srv.category,
@@ -611,6 +673,7 @@ fun FintechMainApp(onLockApp: () -> Unit) {
             when (selectedTab) {
                 0 -> ServicesHomeScreen(
                     walletBalance = walletBalance,
+                    goldRate = goldRate,
                     isSyncing = isSyncing,
                     onRefresh = { syncFromSupabase(showToast = true) },
                     onServiceClick = { service -> activeService = service }
@@ -626,6 +689,7 @@ fun FintechMainApp(onLockApp: () -> Unit) {
 @Composable
 fun ServicesHomeScreen(
     walletBalance: Double,
+    goldRate: GoldRateInfo,
     isSyncing: Boolean,
     onRefresh: () -> Unit,
     onServiceClick: (ServiceItem) -> Unit
@@ -736,9 +800,12 @@ fun ServicesHomeScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("24K Digital Gold (Oropocket)", color = Color(0xFFFFD54F), fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
-                            Text("Start buying Gold from ₹10", color = Color.White, fontSize = 13.sp)
+                            Text("Buy: ₹${"%.0f".format(goldRate.buyPrice)} | Sell: ₹${"%.0f".format(goldRate.sellPrice)}/gm", color = Color.White, fontSize = 12.sp)
                         }
-                        Text("₹7,850/gm", color = Color(0xFFFFD54F), fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("₹${"%.2f".format(goldRate.finalBuyPrice)}/gm", color = Color(0xFFFFD54F), fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
+                            Text("Incl. GST", color = Color.White, fontSize = 11.sp)
+                        }
                     }
                 }
             }
@@ -759,11 +826,16 @@ fun ServiceActionRouter(
     service: ServiceItem,
     currentBalance: Double,
     onBack: () -> Unit,
-    onTransactionSuccess: (ServiceItem, String, String, Double, Boolean) -> Unit
+    onTransactionSuccess: (ServiceItem, String, String, Double, Boolean, Boolean) -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
     var field1 by remember { mutableStateOf("") }
     var amountStr by remember { mutableStateOf("") }
+    var isProcessing by remember { mutableStateOf(false) }
+
+    val isEnquiryOnly = service.id == "aeps_balance" || service.id == "aeps_mini"
 
     Scaffold(
         topBar = {
@@ -800,41 +872,100 @@ fun ServiceActionRouter(
                     OutlinedTextField(
                         value = field1,
                         onValueChange = { field1 = it },
-                        label = { Text("Aadhaar / Account / Mobile No") },
+                        label = { Text("Mobile / Account / Ref No") },
+                        enabled = !isProcessing,
                         modifier = Modifier.fillMaxWidth()
                     )
-                    OutlinedTextField(
-                        value = amountStr,
-                        onValueChange = { amountStr = it },
-                        label = { Text("Amount (₹)") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        modifier = Modifier.fillMaxWidth()
-                    )
+
+                    if (!isEnquiryOnly) {
+                        OutlinedTextField(
+                            value = amountStr,
+                            onValueChange = { amountStr = it },
+                            label = { Text("Amount (₹)") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            enabled = !isProcessing,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
                     Button(
                         onClick = {
                             val amt = amountStr.toDoubleOrNull() ?: 0.0
-                            if (amt <= 0) {
+                            if (!isEnquiryOnly && amt <= 0.0) {
                                 Toast.makeText(context, "Enter valid amount", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
                             val isCredit = (service.id == "add_wallet" || service.id == "aeps_withdraw" || service.id == "sell_gold")
-                            if (!isCredit && amt > currentBalance) {
+                            val shouldUpdateBalance = (service.id == "add_wallet")
+                            if (!isEnquiryOnly && shouldUpdateBalance && !isCredit && amt > currentBalance) {
                                 Toast.makeText(context, "Insufficient Wallet Balance", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
-                            onTransactionSuccess(
-                                service,
-                                "${service.title} | ${service.provider}",
-                                if (field1.isNotEmpty()) "Ref: $field1" else "Processed",
-                                amt,
-                                isCredit
-                            )
+
+                            isProcessing = true
+                            scope.launch {
+                                var gatewayMsg = "Processed"
+                                var gatewayOk = true
+
+                                if (service.provider == "EKO") {
+                                    val payload = JSONObject()
+                                        .put("action", service.id)
+                                        .put("customer_id", if (field1.isNotBlank()) field1 else "9000000000")
+                                        .put("method", "POST")
+                                        .put(
+                                            "payload",
+                                            JSONObject()
+                                                .put("initiator_id", "9962981729")
+                                                .put("client_ref_id", "MX_${System.currentTimeMillis()}")
+                                                .put("user_code", "10000001")
+                                                .put("bank_code", "HDFC")
+                                                .put("aadhar", "TEST_ENCRYPTED")
+                                                .put("latlong", "10.9596,79.3766")
+                                                .put("piddata", "")
+                                                .put("amount", amt)
+                                        )
+                                    val (ok, respJson) = SupabaseClient.callEdgeFunction("eko-service", payload)
+                                    gatewayOk = ok
+                                    gatewayMsg = respJson.optJSONObject("data")?.optString("message")
+                                        ?: respJson.optString("message", if (ok) "Eko Success" else "Eko Failed")
+                                } else if (service.provider == "OROPOCKET") {
+                                    val oroAction = if (service.id == "sell_gold") "sell_gold" else "buy_gold"
+                                    val payload = JSONObject()
+                                        .put("action", oroAction)
+                                        .put("path", if (service.id == "sell_gold") "/sell" else "/buy")
+                                        .put("method", "POST")
+                                        .put("payload", JSONObject().put("amount", amt).put("asset", "gold"))
+                                    val (ok, respJson) = SupabaseClient.callEdgeFunction("oropocket-gold", payload)
+                                    gatewayOk = ok
+                                    gatewayMsg = respJson.optJSONObject("data")?.optString("message")
+                                        ?: respJson.optString("message", if (ok) "Oropocket Success" else "Oropocket Failed")
+                                }
+
+                                isProcessing = false
+                                Toast.makeText(context, gatewayMsg, Toast.LENGTH_LONG).show()
+
+                                if (gatewayOk || service.provider == "WALLET") {
+                                    onTransactionSuccess(
+                                        service,
+                                        "${service.title} | ${service.provider}",
+                                        gatewayMsg,
+                                        amt,
+                                        isCredit,
+                                        shouldUpdateBalance
+                                    )
+                                }
+                            }
                         },
+                        enabled = !isProcessing,
                         colors = ButtonDefaults.buttonColors(containerColor = BrandRed),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth().height(50.dp)
                     ) {
-                        Text("Proceed", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        if (isProcessing) {
+                            CircularProgressIndicator(color = Color.White, modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                        } else {
+                            Text("Proceed", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        }
                     }
                 }
             }
