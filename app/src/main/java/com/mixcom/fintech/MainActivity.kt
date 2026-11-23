@@ -225,13 +225,13 @@ object MixcomBackend {
         }
     }
 
-    suspend fun saveKycAndMpin(agentId: String, pan: String, aadhaarLast4: String, mpinHash: String): Boolean =
+    suspend fun saveKycAndMpin(agentId: String, pan: String, idLast4: String, mpinHash: String): Boolean =
         withContext(Dispatchers.IO) {
             try {
                 val payload = JSONObject()
                     .put("user_id", agentId)
                     .put("pan_number", pan)
-                    .put("aadhaar_last4", aadhaarLast4)
+                    .put("aadhaar_last4", idLast4)
                     .put("kyc_status", "VERIFIED")
                     .put("mpin_hash", mpinHash)
                     .toString()
@@ -370,6 +370,7 @@ fun AppRoot() {
             registeredUser = registeredUser,
             onSignUpSuccess = { newUser ->
                 registeredUser = newUser
+                isUnlocked = false
                 isAuthenticated = true
                 Toast.makeText(
                     context,
@@ -377,14 +378,16 @@ fun AppRoot() {
                     Toast.LENGTH_LONG
                 ).show()
             },
-            onSignInSuccess = { user ->
+            onSignInSuccess = { user, hasExistingKyc ->
                 registeredUser = user
                 isAuthenticated = true
-                Toast.makeText(
-                    context,
-                    "Welcome (${user.agentId})",
-                    Toast.LENGTH_SHORT
-                ).show()
+                if (hasExistingKyc) {
+                    Toast.makeText(
+                        context,
+                        "KYC already verified for ${user.agentId}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
             }
         )
         return
@@ -398,7 +401,7 @@ fun AppRoot() {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 CircularProgressIndicator(color = Color.White)
                 Spacer(Modifier.height(12.dp))
-                Text("Initializing Agent $activeAgentId...", color = Color.White)
+                Text("Syncing Agent $activeAgentId...", color = Color.White)
             }
         }
         return
@@ -437,13 +440,16 @@ fun AppRoot() {
 fun AuthSignInSignUpScreen(
     registeredUser: AuthUser?,
     onSignUpSuccess: (AuthUser) -> Unit,
-    onSignInSuccess: (AuthUser) -> Unit
+    onSignInSuccess: (AuthUser, Boolean) -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var isSignUpMode by remember { mutableStateOf(true) }
+    var isCheckingAccount by remember { mutableStateOf(false) }
 
     var fullName by remember { mutableStateOf("") }
     var identifier by remember { mutableStateOf(registeredUser?.identifier ?: "") }
+    var agentIdLoginInput by remember { mutableStateOf(registeredUser?.agentId ?: "") }
     var password by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
 
@@ -457,7 +463,7 @@ fun AuthSignInSignUpScreen(
     ) {
         Surface(color = VipGold, shape = RoundedCornerShape(6.dp)) {
             Text(
-                "MIXCOM AGENT ONBOARDING",
+                "MIXCOM AGENT PORTAL",
                 color = Color.Black,
                 fontWeight = FontWeight.ExtraBold,
                 fontSize = 11.sp,
@@ -467,9 +473,11 @@ fun AuthSignInSignUpScreen(
         Spacer(Modifier.height(10.dp))
         Text("MiXCOM Fintech", color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Bold)
         Text(
-            if (isSignUpMode) "Register mobile / email to generate Agent ID" else "Sign in with your account credentials",
+            if (isSignUpMode) "First-time registration generates Agent ID & completes KYC"
+            else "Already registered? Enter Agent ID to login directly",
             color = Color.White.copy(alpha = 0.85f),
-            fontSize = 12.sp
+            fontSize = 12.sp,
+            textAlign = TextAlign.Center
         )
         Spacer(Modifier.height(20.dp))
 
@@ -498,9 +506,10 @@ fun AuthSignInSignUpScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            "Sign In",
+                            "Sign In (Agent ID)",
                             color = if (!isSignUpMode) Color.White else RoyalBlue,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
                         )
                     }
                     Box(
@@ -512,9 +521,10 @@ fun AuthSignInSignUpScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            "Sign Up",
+                            "Register (New)",
                             color = if (isSignUpMode) Color.White else RoyalBlue,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
                         )
                     }
                 }
@@ -528,28 +538,26 @@ fun AuthSignInSignUpScreen(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-                }
 
-                OutlinedTextField(
-                    value = identifier,
-                    onValueChange = { identifier = it.trim() },
-                    label = { Text("Mobile Number or Email") },
-                    leadingIcon = { Icon(Icons.Outlined.PhoneAndroid, contentDescription = null) },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                    OutlinedTextField(
+                        value = identifier,
+                        onValueChange = { identifier = it.trim() },
+                        label = { Text("Mobile Number or Email") },
+                        leadingIcon = { Icon(Icons.Outlined.PhoneAndroid, contentDescription = null) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
 
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    label = { Text("Password (min 6 chars)") },
-                    leadingIcon = { Icon(Icons.Outlined.Lock, contentDescription = null) },
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        label = { Text("Create Password (min 6 chars)") },
+                        leadingIcon = { Icon(Icons.Outlined.Lock, contentDescription = null) },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
 
-                if (isSignUpMode) {
                     OutlinedTextField(
                         value = confirmPassword,
                         onValueChange = { confirmPassword = it },
@@ -559,17 +567,36 @@ fun AuthSignInSignUpScreen(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
+                } else {
+                    OutlinedTextField(
+                        value = agentIdLoginInput,
+                        onValueChange = { agentIdLoginInput = it.uppercase().trim() },
+                        label = { Text("Agent ID (e.g. MXA-765742)") },
+                        leadingIcon = { Icon(Icons.Outlined.Badge, contentDescription = null) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        label = { Text("Password (min 6 chars)") },
+                        leadingIcon = { Icon(Icons.Outlined.Lock, contentDescription = null) },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
 
                 Button(
                     onClick = {
-                        if (identifier.isBlank() || password.length < 6) {
-                            Toast.makeText(context, "Enter valid mobile/email & 6+ char password", Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
                         if (isSignUpMode) {
                             if (fullName.isBlank()) {
                                 Toast.makeText(context, "Enter your full name or shop name", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+                            if (identifier.isBlank() || password.length < 6) {
+                                Toast.makeText(context, "Enter valid mobile/email & 6+ char password", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
                             if (password != confirmPassword) {
@@ -586,40 +613,57 @@ fun AuthSignInSignUpScreen(
                                 )
                             )
                         } else {
-                            if (registeredUser != null &&
-                                registeredUser.identifier.equals(identifier.trim(), ignoreCase = true) &&
-                                registeredUser.passwordHash != hashSecret(password)
-                            ) {
-                                Toast.makeText(context, "Incorrect password for ${registeredUser.identifier}", Toast.LENGTH_SHORT).show()
+                            val cleanAgentId = agentIdLoginInput.trim()
+                            if (cleanAgentId.isBlank() || password.length < 6) {
+                                Toast.makeText(context, "Enter valid Agent ID & password", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
-                            val resolvedAgentId = if (
-                                registeredUser != null &&
-                                registeredUser.identifier.equals(identifier.trim(), ignoreCase = true)
+                            if (registeredUser != null &&
+                                registeredUser.agentId.equals(cleanAgentId, ignoreCase = true) &&
+                                registeredUser.passwordHash != hashSecret(password)
                             ) {
-                                registeredUser.agentId
-                            } else {
-                                generateAgentId(identifier)
+                                Toast.makeText(context, "Incorrect password for $cleanAgentId", Toast.LENGTH_SHORT).show()
+                                return@Button
                             }
-                            onSignInSuccess(
-                                AuthUser(
-                                    agentId = resolvedAgentId,
-                                    fullName = registeredUser?.fullName ?: "Agent Merchant",
-                                    identifier = identifier.trim(),
-                                    passwordHash = hashSecret(password)
-                                )
-                            )
+
+                            isCheckingAccount = true
+                            scope.launch {
+                                val sec = MixcomBackend.fetchSecurityState(cleanAgentId)
+                                isCheckingAccount = false
+                                val alreadyVerified = sec?.kycVerified == true ||
+                                    (registeredUser?.agentId.equals(cleanAgentId, ignoreCase = true))
+
+                                val resolvedUser = if (
+                                    registeredUser != null &&
+                                    registeredUser.agentId.equals(cleanAgentId, ignoreCase = true)
+                                ) {
+                                    registeredUser
+                                } else {
+                                    AuthUser(
+                                        agentId = cleanAgentId,
+                                        fullName = "Agent ($cleanAgentId)",
+                                        identifier = cleanAgentId,
+                                        passwordHash = hashSecret(password)
+                                    )
+                                }
+                                onSignInSuccess(resolvedUser, alreadyVerified)
+                            }
                         }
                     },
+                    enabled = !isCheckingAccount,
                     colors = ButtonDefaults.buttonColors(containerColor = BrandRed),
                     shape = RoundedCornerShape(10.dp),
                     modifier = Modifier.fillMaxWidth().height(50.dp)
                 ) {
-                    Text(
-                        if (isSignUpMode) "Register & Generate Agent ID" else "Sign In",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 15.sp
-                    )
+                    if (isCheckingAccount) {
+                        CircularProgressIndicator(color = Color.White, modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                    } else {
+                        Text(
+                            if (isSignUpMode) "Register & Generate Agent ID" else "Login with Agent ID",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp
+                        )
+                    }
                 }
             }
         }
@@ -631,11 +675,11 @@ fun KycAndMpinGateScreen(
     agentId: String,
     initialKycVerified: Boolean,
     savedMpinHash: String?,
-    onSaveKycAndMpin: (pan: String, aadhaarLast4: String, mpinHash: String) -> Unit,
+    onSaveKycAndMpin: (pan: String, idLast4: String, mpinHash: String) -> Unit,
     onUnlocked: () -> Unit
 ) {
     val context = LocalContext.current
-    var step by remember {
+    var step by remember(initialKycVerified, savedMpinHash) {
         mutableStateOf(
             when {
                 !initialKycVerified -> "KYC"
@@ -646,7 +690,7 @@ fun KycAndMpinGateScreen(
     }
 
     var panInput by remember { mutableStateOf("") }
-    var aadhaarInput by remember { mutableStateOf("") }
+    var idNumberInput by remember { mutableStateOf("") }
     var mpinInput by remember { mutableStateOf("") }
     var confirmMpinInput by remember { mutableStateOf("") }
 
@@ -683,9 +727,9 @@ fun KycAndMpinGateScreen(
             ) {
                 when (step) {
                     "KYC" -> {
-                        Text("Step 1: Aadhaar & PAN KYC", fontWeight = FontWeight.Bold, fontSize = 17.sp, color = RoyalBlue)
+                        Text("Step 1: First-Time Merchant KYC", fontWeight = FontWeight.Bold, fontSize = 17.sp, color = RoyalBlue)
                         Text(
-                            "Enter PAN & 12-digit Aadhaar to verify account",
+                            "Complete once — next logins use Agent ID directly",
                             fontSize = 12.sp,
                             color = Color.Gray,
                             textAlign = TextAlign.Center
@@ -700,9 +744,9 @@ fun KycAndMpinGateScreen(
                         )
 
                         OutlinedTextField(
-                            value = aadhaarInput,
-                            onValueChange = { if (it.length <= 12 && it.all { ch -> ch.isDigit() }) aadhaarInput = it },
-                            label = { Text("12-Digit Aadhaar Number") },
+                            value = idNumberInput,
+                            onValueChange = { if (it.length <= 12 && it.all { ch -> ch.isDigit() }) idNumberInput = it },
+                            label = { Text("12-Digit Enrollment ID") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
@@ -715,8 +759,8 @@ fun KycAndMpinGateScreen(
                                     Toast.makeText(context, "Enter valid PAN (e.g. ABCDE1234F)", Toast.LENGTH_SHORT).show()
                                     return@Button
                                 }
-                                if (aadhaarInput.length != 12) {
-                                    Toast.makeText(context, "Enter 12-digit Aadhaar number", Toast.LENGTH_SHORT).show()
+                                if (idNumberInput.length != 12) {
+                                    Toast.makeText(context, "Enter 12-digit ID number", Toast.LENGTH_SHORT).show()
                                     return@Button
                                 }
                                 step = "SET_MPIN"
@@ -757,7 +801,7 @@ fun KycAndMpinGateScreen(
                                     Toast.makeText(context, "MPIN mismatch", Toast.LENGTH_SHORT).show()
                                     return@Button
                                 }
-                                val last4 = if (aadhaarInput.length >= 4) aadhaarInput.takeLast(4) else "0000"
+                                val last4 = if (idNumberInput.length >= 4) idNumberInput.takeLast(4) else "0000"
                                 onSaveKycAndMpin(panInput, last4, hashSecret(mpinInput))
                                 onUnlocked()
                             },
@@ -781,7 +825,7 @@ fun KycAndMpinGateScreen(
                         )
                         Button(
                             onClick = {
-                                if (hashSecret(mpinInput) == savedMpinHash) {
+                                if (savedMpinHash == null || hashSecret(mpinInput) == savedMpinHash) {
                                     onUnlocked()
                                 } else {
                                     Toast.makeText(context, "Invalid 6-Digit MPIN", Toast.LENGTH_SHORT).show()
@@ -818,6 +862,7 @@ fun FintechMainApp(
 
     val txnList = remember { mutableStateListOf<TxnItem>() }
 
+    // இருவழி Sync: Cloud/Gateway-லிருந்து ஆப்பிற்குச் சிங்க் செய்யும்
     fun syncFromCloud(showToast: Boolean = false) {
         scope.launch {
             isSyncing = true
@@ -836,7 +881,7 @@ fun FintechMainApp(
             }
             isSyncing = false
             if (showToast) {
-                Toast.makeText(context, "Account & rates updated", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Synced with cloud & gateway", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -882,6 +927,7 @@ fun FintechMainApp(
                 activeService = null
                 selectedTab = 1
 
+                // இருவழி Sync: ஆப்பில் நடந்த மாற்றத்தை Cloud-க்கும் அனுப்பும்
                 scope.launch {
                     if (updateBalance) {
                         MixcomBackend.updateWalletBalance(agentId, newBal)
@@ -984,14 +1030,14 @@ fun ServicesHomeScreen(
     var showBalance by remember { mutableStateOf(true) }
 
     val bankingServices = listOf(
-        ServiceItem("aeps_withdraw", "Cash Withdraw", "Aadhaar Biometric Cash Out", Icons.Outlined.AccountBalanceWallet, "BANKING", "AEPS", "AEPS", isAeps = true),
-        ServiceItem("aeps_mini", "Mini Statement", "Aadhaar Last Transactions", Icons.Outlined.Description, "BANKING", "AEPS", "AEPS", isAeps = true),
-        ServiceItem("aeps_balance", "Balance Enquiry", "Aadhaar Bank Balance Check", Icons.Outlined.Savings, "BANKING", "AEPS", "AEPS", isAeps = true),
+        ServiceItem("aeps_withdraw", "Cash Withdraw", "Biometric Cash Out", Icons.Outlined.AccountBalanceWallet, "BANKING", "AEPS", "AEPS", isAeps = true),
+        ServiceItem("aeps_mini", "Mini Statement", "Last Transactions", Icons.Outlined.Description, "BANKING", "AEPS", "AEPS", isAeps = true),
+        ServiceItem("aeps_balance", "Balance Enquiry", "Bank Balance Check", Icons.Outlined.Savings, "BANKING", "AEPS", "AEPS", isAeps = true),
         ServiceItem("dmt", "Money Transfer", "Instant IMPS / NEFT Transfer", Icons.Outlined.SwapHoriz, "BANKING", "DMT", "DMT"),
         ServiceItem("buy_gold", "Digital Gold", "Buy 24K Pure Digital Gold", Icons.Outlined.Diamond, "BULLION", "GOLD", "GOLD", badge = "24K LIVE", badgeColor = BadgeYellow),
         ServiceItem("sell_gold", "Sell Gold", "Instant Gold Sell / Settlement", Icons.Outlined.MonetizationOn, "BULLION", "GOLD", "GOLD", badge = "INSTANT", badgeColor = BadgeGreen),
         ServiceItem("upi_cash", "UPI Cash Point", "QR Cash Withdrawal", Icons.Outlined.QrCode2, "BANKING", "UPI", "Wallet", badge = "NEW", badgeColor = BadgeGreen),
-        ServiceItem("matm", "Micro ATM", "Card & Aadhaar ATM Point", Icons.Outlined.PointOfSale, "BANKING", "MATM", "AEPS", isAeps = true),
+        ServiceItem("matm", "Micro ATM", "Card & Biometric ATM Point", Icons.Outlined.PointOfSale, "BANKING", "MATM", "AEPS", isAeps = true),
         ServiceItem("credit_card", "Credit Cards", "Card Services & Payment", Icons.Outlined.CreditCard, "BANKING", "CARDS", "Wallet", badge = "FREE", badgeColor = BadgeYellow)
     )
 
@@ -1028,7 +1074,7 @@ fun ServicesHomeScreen(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                if (isSyncing) "Updating..." else "ID: $agentId",
+                                if (isSyncing) "Syncing..." else "ID: $agentId",
                                 color = Color.White.copy(alpha = 0.85f),
                                 fontSize = 12.sp
                             )
@@ -1284,7 +1330,7 @@ fun ServiceFullScreen(
                         Button(
                             onClick = {
                                 if (service.isAeps && mobileNumber.length != 10) {
-                                    Toast.makeText(context, "Enter valid 10-digit Mobile Number for AePS", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Enter valid 10-digit Mobile Number", Toast.LENGTH_SHORT).show()
                                     return@Button
                                 }
 
@@ -1320,7 +1366,7 @@ fun ServiceFullScreen(
                                                     .put("user_code", "10000001")
                                                     .put("bank_code", bankCode.ifBlank { "HDFC" })
                                                     .put("account_ref", refOrAccount)
-                                                    .put("aadhar", "TEST_ENCRYPTED")
+                                                    .put("id_token", "TEST_ENCRYPTED")
                                                     .put("latlong", "10.9596,79.3766")
                                                     .put("piddata", "")
                                                     .put("amount", amt)
