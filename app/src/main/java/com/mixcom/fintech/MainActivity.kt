@@ -263,10 +263,30 @@ object MixcomBackend {
     suspend fun updateWalletBalance(agentId: String, newBalance: Double): Boolean = withContext(Dispatchers.IO) {
         try {
             val payload = JSONObject().put("balance", newBalance).toString()
-            val req = dataRequest("wallets?user_id=eq.$agentId")
+            val patchReq = dataRequest("wallets?user_id=eq.$agentId")
+                .addHeader("Prefer", "return=representation")
                 .patch(payload.toRequestBody(jsonMediaType))
                 .build()
-            client.newCall(req).execute().use { it.isSuccessful }
+
+            client.newCall(patchReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val body = resp.body?.string().orEmpty()
+                    if (body.trim().startsWith("[") && JSONArray(body).length() > 0) {
+                        return@withContext true
+                    }
+                }
+            }
+
+            // Wallet row இன்னும் இல்லை என்றால் upsert மூலம் உருவாக்கி அப்டேட் செய்யும்
+            val upsertPayload = JSONObject()
+                .put("user_id", agentId)
+                .put("balance", newBalance)
+                .toString()
+            val upsertReq = dataRequest("wallets?on_conflict=user_id")
+                .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
+                .post(upsertPayload.toRequestBody(jsonMediaType))
+                .build()
+            client.newCall(upsertReq).execute().use { it.isSuccessful }
         } catch (_: Exception) {
             false
         }
@@ -862,7 +882,6 @@ fun FintechMainApp(
 
     val txnList = remember { mutableStateListOf<TxnItem>() }
 
-    // இருவழி Sync: Cloud/Gateway-லிருந்து ஆப்பிற்குச் சிங்க் செய்யும்
     fun syncFromCloud(showToast: Boolean = false) {
         scope.launch {
             isSyncing = true
@@ -906,7 +925,7 @@ fun FintechMainApp(
                 } else if (isCredit) {
                     walletBalance + amt
                 } else {
-                    walletBalance - amt
+                    (walletBalance - amt).coerceAtLeast(0.0)
                 }
                 val transId = (10000000000000..99999999999999).random().toString()
                 val prefix = if (isCredit) "+ Rs" else "- Rs"
@@ -927,12 +946,11 @@ fun FintechMainApp(
                 activeService = null
                 selectedTab = 1
 
-                // இருவழி Sync: ஆப்பில் நடந்த மாற்றத்தை Cloud-க்கும் அனுப்பும்
                 scope.launch {
-                    if (updateBalance) {
+                    val balSaved = if (updateBalance) {
                         MixcomBackend.updateWalletBalance(agentId, newBal)
-                    }
-                    MixcomBackend.insertTransaction(
+                    } else true
+                    val txnSaved = MixcomBackend.insertTransaction(
                         agentId = agentId,
                         transId = transId,
                         category = srv.category,
@@ -943,6 +961,9 @@ fun FintechMainApp(
                         balanceAfter = newBal,
                         isCredit = isCredit
                     )
+                    if (!balSaved || !txnSaved) {
+                        Toast.makeText(context, "Cloud sync pending — check connection", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
         )
@@ -1340,9 +1361,14 @@ fun ServiceFullScreen(
                                     return@Button
                                 }
 
-                                val isCredit = (service.id == "add_wallet" || service.id == "aeps_withdraw" || service.id == "sell_gold")
-                                val shouldUpdateBalance = (service.id == "add_wallet")
-                                if (needsAmount && shouldUpdateBalance && !isCredit && amt > currentBalance) {
+                                val isCredit = (
+                                    service.id == "add_wallet" ||
+                                    service.id == "aeps_withdraw" ||
+                                    service.id == "sell_gold"
+                                )
+                                val shouldUpdateBalance = needsAmount
+
+                                if (needsAmount && !isCredit && amt > currentBalance) {
                                     Toast.makeText(context, "Insufficient Wallet Balance", Toast.LENGTH_SHORT).show()
                                     return@Button
                                 }
