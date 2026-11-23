@@ -45,9 +45,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 
-// === இங்கே உங்கள் Supabase URL மற்றும் Anon Key-ஐ மாற்றவும் ===
-const val SUPABASE_URL = "https://bwowvsrcehixusbkhctv.supabase.co"
-const val SUPABASE_ANON_KEY = "sb_publishable_ohZfbMRrAR2GwR-GtytDhA_WZ0ZknTK"
+// === இங்கே உங்கள் Backend URL மற்றும் Public Key-ஐ மாற்றவும் ===
+const val BACKEND_BASE_URL = "https://bwowvsrcehixusbkhctv.supabase.co"
+const val BACKEND_PUBLIC_KEY = "sb_publishable_ohZfbMRrAR2GwR-GtytDhA_WZ0ZknTK"
 const val DEFAULT_AGENT_ID = "MXA-100001"
 
 val RoyalBlue = Color(0xFF1D3587)
@@ -109,7 +109,8 @@ data class ServiceItem(
     val title: String,
     val subtitle: String,
     val icon: ImageVector,
-    val provider: String, // "EKO", "OROPOCKET", "WALLET"
+    val channelCode: String, // "BANKING", "BULLION", "WALLET"
+    val badgeLabel: String,
     val category: String = "Wallet",
     val isAeps: Boolean = false,
     val badge: String? = null,
@@ -126,27 +127,27 @@ data class TxnItem(
     val isCredit: Boolean
 )
 
-object SupabaseClient {
+object MixcomBackend {
     private val client = OkHttpClient()
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-    private fun baseRequest(endpoint: String): Request.Builder {
+    private fun dataRequest(endpoint: String): Request.Builder {
         return Request.Builder()
-            .url("$SUPABASE_URL/rest/v1/$endpoint")
-            .addHeader("apikey", SUPABASE_ANON_KEY)
-            .addHeader("Authorization", "Bearer $SUPABASE_ANON_KEY")
+            .url("$BACKEND_BASE_URL/rest/v1/$endpoint")
+            .addHeader("apikey", BACKEND_PUBLIC_KEY)
+            .addHeader("Authorization", "Bearer $BACKEND_PUBLIC_KEY")
             .addHeader("Content-Type", "application/json")
     }
 
-    suspend fun callEdgeFunction(
-        functionName: String,
+    suspend fun invokeGateway(
+        routeSlug: String,
         payloadJson: JSONObject
     ): Pair<Boolean, JSONObject> = withContext(Dispatchers.IO) {
         try {
             val req = Request.Builder()
-                .url("$SUPABASE_URL/functions/v1/$functionName")
-                .addHeader("apikey", SUPABASE_ANON_KEY)
-                .addHeader("Authorization", "Bearer $SUPABASE_ANON_KEY")
+                .url("$BACKEND_BASE_URL/functions/v1/$routeSlug")
+                .addHeader("apikey", BACKEND_PUBLIC_KEY)
+                .addHeader("Authorization", "Bearer $BACKEND_PUBLIC_KEY")
                 .addHeader("Content-Type", "application/json")
                 .post(payloadJson.toString().toRequestBody(jsonMediaType))
                 .build()
@@ -164,7 +165,7 @@ object SupabaseClient {
 
     suspend fun fetchGoldRate(): GoldRateInfo? = withContext(Dispatchers.IO) {
         try {
-            val (ok, json) = callEdgeFunction("oropocket-gold", JSONObject().put("action", "get_gold_rate"))
+            val (ok, json) = invokeGateway("oropocket-gold", JSONObject().put("action", "get_gold_rate"))
             if (!ok) return@withContext null
             val goldObj = json.optJSONObject("data")
                 ?.optJSONObject("data")
@@ -190,7 +191,7 @@ object SupabaseClient {
                     .put("balance", initialBalance)
                     .toString()
 
-                val req = baseRequest("wallets?on_conflict=user_id")
+                val req = dataRequest("wallets?on_conflict=user_id")
                     .addHeader("Prefer", "resolution=ignore-duplicates,return=minimal")
                     .post(payload.toRequestBody(jsonMediaType))
                     .build()
@@ -202,7 +203,7 @@ object SupabaseClient {
 
     suspend fun fetchSecurityState(agentId: String): SecurityState? = withContext(Dispatchers.IO) {
         try {
-            val req = baseRequest("agent_security?user_id=eq.$agentId&select=kyc_status,mpin_hash").get().build()
+            val req = dataRequest("agent_security?user_id=eq.$agentId&select=kyc_status,mpin_hash").get().build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@withContext null
                 val body = resp.body?.string() ?: return@withContext null
@@ -235,7 +236,7 @@ object SupabaseClient {
                     .put("mpin_hash", mpinHash)
                     .toString()
 
-                val req = baseRequest("agent_security?on_conflict=user_id")
+                val req = dataRequest("agent_security?on_conflict=user_id")
                     .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
                     .post(payload.toRequestBody(jsonMediaType))
                     .build()
@@ -247,7 +248,7 @@ object SupabaseClient {
 
     suspend fun fetchWalletBalance(agentId: String): Double? = withContext(Dispatchers.IO) {
         try {
-            val req = baseRequest("wallets?user_id=eq.$agentId&select=balance").get().build()
+            val req = dataRequest("wallets?user_id=eq.$agentId&select=balance").get().build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@withContext null
                 val body = resp.body?.string() ?: return@withContext null
@@ -262,7 +263,7 @@ object SupabaseClient {
     suspend fun updateWalletBalance(agentId: String, newBalance: Double): Boolean = withContext(Dispatchers.IO) {
         try {
             val payload = JSONObject().put("balance", newBalance).toString()
-            val req = baseRequest("wallets?user_id=eq.$agentId")
+            val req = dataRequest("wallets?user_id=eq.$agentId")
                 .patch(payload.toRequestBody(jsonMediaType))
                 .build()
             client.newCall(req).execute().use { it.isSuccessful }
@@ -273,7 +274,7 @@ object SupabaseClient {
 
     suspend fun fetchTransactions(agentId: String): List<TxnItem>? = withContext(Dispatchers.IO) {
         try {
-            val req = baseRequest("transactions?user_id=eq.$agentId&order=created_at.desc&limit=30").get().build()
+            val req = dataRequest("transactions?user_id=eq.$agentId&order=created_at.desc&limit=30").get().build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@withContext null
                 val body = resp.body?.string() ?: return@withContext null
@@ -328,7 +329,7 @@ object SupabaseClient {
                 .put("is_credit", isCredit)
                 .toString()
 
-            val req = baseRequest("transactions")
+            val req = dataRequest("transactions")
                 .addHeader("Prefer", "return=minimal")
                 .post(payload.toRequestBody(jsonMediaType))
                 .build()
@@ -356,8 +357,8 @@ fun AppRoot() {
     LaunchedEffect(isAuthenticated, activeAgentId) {
         if (!isAuthenticated) return@LaunchedEffect
         isLoadingSecurity = true
-        SupabaseClient.createInitialWalletIfMissing(activeAgentId, 0.0)
-        val remote = SupabaseClient.fetchSecurityState(activeAgentId)
+        MixcomBackend.createInitialWalletIfMissing(activeAgentId, 0.0)
+        val remote = MixcomBackend.fetchSecurityState(activeAgentId)
         if (remote != null) {
             securityState = remote
         }
@@ -381,7 +382,7 @@ fun AppRoot() {
                 isAuthenticated = true
                 Toast.makeText(
                     context,
-                    "Signed in (${user.agentId})",
+                    "Welcome (${user.agentId})",
                     Toast.LENGTH_SHORT
                 ).show()
             }
@@ -411,9 +412,9 @@ fun AppRoot() {
             onSaveKycAndMpin = { pan, last4, mpinHash ->
                 securityState = SecurityState(kycVerified = true, mpinHash = mpinHash)
                 scope.launch {
-                    val ok = SupabaseClient.saveKycAndMpin(activeAgentId, pan, last4, mpinHash)
+                    val ok = MixcomBackend.saveKycAndMpin(activeAgentId, pan, last4, mpinHash)
                     if (!ok) {
-                        Toast.makeText(context, "Saved locally (check Supabase URL/Key)", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Saved locally (check cloud sync)", Toast.LENGTH_SHORT).show()
                     }
                 }
             },
@@ -817,13 +818,13 @@ fun FintechMainApp(
 
     val txnList = remember { mutableStateListOf<TxnItem>() }
 
-    fun syncFromSupabase(showToast: Boolean = false) {
+    fun syncFromCloud(showToast: Boolean = false) {
         scope.launch {
             isSyncing = true
-            SupabaseClient.createInitialWalletIfMissing(agentId, 0.0)
-            val dbBalance = SupabaseClient.fetchWalletBalance(agentId)
-            val dbTxns = SupabaseClient.fetchTransactions(agentId)
-            val liveGold = SupabaseClient.fetchGoldRate()
+            MixcomBackend.createInitialWalletIfMissing(agentId, 0.0)
+            val dbBalance = MixcomBackend.fetchWalletBalance(agentId)
+            val dbTxns = MixcomBackend.fetchTransactions(agentId)
+            val liveGold = MixcomBackend.fetchGoldRate()
 
             if (dbBalance != null) walletBalance = dbBalance
             if (dbTxns != null) {
@@ -835,13 +836,13 @@ fun FintechMainApp(
             }
             isSyncing = false
             if (showToast) {
-                Toast.makeText(context, "Synced with Supabase & Edge Functions!", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Account & rates updated", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
     LaunchedEffect(agentId) {
-        syncFromSupabase(showToast = false)
+        syncFromCloud(showToast = false)
     }
 
     BackHandler(enabled = activeService != null) {
@@ -883,13 +884,13 @@ fun FintechMainApp(
 
                 scope.launch {
                     if (updateBalance) {
-                        SupabaseClient.updateWalletBalance(agentId, newBal)
+                        MixcomBackend.updateWalletBalance(agentId, newBal)
                     }
-                    SupabaseClient.insertTransaction(
+                    MixcomBackend.insertTransaction(
                         agentId = agentId,
                         transId = transId,
                         category = srv.category,
-                        provider = srv.provider,
+                        provider = srv.badgeLabel,
                         title = title,
                         subtitle = sub,
                         amount = amt,
@@ -956,7 +957,7 @@ fun FintechMainApp(
                     walletBalance = walletBalance,
                     goldRate = goldRate,
                     isSyncing = isSyncing,
-                    onRefresh = { syncFromSupabase(showToast = true) },
+                    onRefresh = { syncFromCloud(showToast = true) },
                     onServiceClick = { service -> activeService = service }
                 )
                 1 -> HistoryScreen(txns = txnList, onBack = { selectedTab = 0 })
@@ -983,26 +984,26 @@ fun ServicesHomeScreen(
     var showBalance by remember { mutableStateOf(true) }
 
     val bankingServices = listOf(
-        ServiceItem("aeps_withdraw", "Cash Withdraw", "AePS Aadhaar Cash Out", Icons.Outlined.AccountBalanceWallet, "EKO", "AEPS", isAeps = true),
-        ServiceItem("aeps_mini", "Mini Statement", "AePS Last Transactions", Icons.Outlined.Description, "EKO", "AEPS", isAeps = true),
-        ServiceItem("aeps_balance", "Balance Enquiry", "AePS Bank Balance Check", Icons.Outlined.Savings, "EKO", "AEPS", isAeps = true),
-        ServiceItem("dmt", "Money Transfer", "Instant IMPS / NEFT DMT", Icons.Outlined.SwapHoriz, "EKO", "DMT"),
-        ServiceItem("buy_gold", "Digital Gold", "Buy 24K Gold via Oropocket", Icons.Outlined.Diamond, "OROPOCKET", "GOLD", badge = "24K LIVE", badgeColor = BadgeYellow),
-        ServiceItem("sell_gold", "Sell Gold", "Instant Gold Sell / Cash", Icons.Outlined.MonetizationOn, "OROPOCKET", "GOLD", badge = "INSTANT", badgeColor = BadgeGreen),
-        ServiceItem("upi_cash", "UPI Cash Point", "QR Cash Withdrawal", Icons.Outlined.QrCode2, "EKO", "Wallet", badge = "NEW", badgeColor = BadgeGreen),
-        ServiceItem("matm", "Micro ATM", "Card & Aadhaar ATM Point", Icons.Outlined.PointOfSale, "EKO", "AEPS", isAeps = true),
-        ServiceItem("credit_card", "Credit Cards", "Card Services & Payment", Icons.Outlined.CreditCard, "EKO", "Wallet", badge = "FREE", badgeColor = BadgeYellow)
+        ServiceItem("aeps_withdraw", "Cash Withdraw", "Aadhaar Biometric Cash Out", Icons.Outlined.AccountBalanceWallet, "BANKING", "AEPS", "AEPS", isAeps = true),
+        ServiceItem("aeps_mini", "Mini Statement", "Aadhaar Last Transactions", Icons.Outlined.Description, "BANKING", "AEPS", "AEPS", isAeps = true),
+        ServiceItem("aeps_balance", "Balance Enquiry", "Aadhaar Bank Balance Check", Icons.Outlined.Savings, "BANKING", "AEPS", "AEPS", isAeps = true),
+        ServiceItem("dmt", "Money Transfer", "Instant IMPS / NEFT Transfer", Icons.Outlined.SwapHoriz, "BANKING", "DMT", "DMT"),
+        ServiceItem("buy_gold", "Digital Gold", "Buy 24K Pure Digital Gold", Icons.Outlined.Diamond, "BULLION", "GOLD", "GOLD", badge = "24K LIVE", badgeColor = BadgeYellow),
+        ServiceItem("sell_gold", "Sell Gold", "Instant Gold Sell / Settlement", Icons.Outlined.MonetizationOn, "BULLION", "GOLD", "GOLD", badge = "INSTANT", badgeColor = BadgeGreen),
+        ServiceItem("upi_cash", "UPI Cash Point", "QR Cash Withdrawal", Icons.Outlined.QrCode2, "BANKING", "UPI", "Wallet", badge = "NEW", badgeColor = BadgeGreen),
+        ServiceItem("matm", "Micro ATM", "Card & Aadhaar ATM Point", Icons.Outlined.PointOfSale, "BANKING", "MATM", "AEPS", isAeps = true),
+        ServiceItem("credit_card", "Credit Cards", "Card Services & Payment", Icons.Outlined.CreditCard, "BANKING", "CARDS", "Wallet", badge = "FREE", badgeColor = BadgeYellow)
     )
 
     val billsServices = listOf(
-        ServiceItem("mobile_prepaid", "Mobile Prepaid", "All Operators Recharge", Icons.Outlined.Smartphone, "EKO", "Recharge", badge = "Upto 2%"),
-        ServiceItem("loan_repay", "Loan Repayment", "EMI & Loan Collection", Icons.Outlined.RequestQuote, "EKO", "Recharge", badge = "Flat 0.15%"),
-        ServiceItem("electricity", "Electricity", "TNEB & State Electricity", Icons.Outlined.Lightbulb, "EKO", "Recharge", badge = "Flat ₹1"),
-        ServiceItem("dth", "DTH", "DTH TV Recharge", Icons.Outlined.SettingsInputAntenna, "EKO", "Recharge", badge = "Upto 1.50%"),
-        ServiceItem("agent_coll", "Agent Collection", "Field Collection Service", Icons.Outlined.Storefront, "EKO", "Wallet", badge = "Flat 0.11%"),
-        ServiceItem("cc_bill", "Credit Card Bill", "BBPS Card Bill Pay", Icons.Outlined.CreditScore, "EKO", "Recharge", badge = "Flat ₹0.5"),
-        ServiceItem("fastag", "FASTag", "Toll Tag Recharge", Icons.Outlined.DirectionsCar, "EKO", "Recharge", badge = "Flat 0.15%"),
-        ServiceItem("postpaid", "Mobile Postpaid", "Postpaid Bill Payment", Icons.Outlined.PhoneAndroid, "EKO", "Recharge")
+        ServiceItem("mobile_prepaid", "Mobile Prepaid", "All Operators Recharge", Icons.Outlined.Smartphone, "BANKING", "BBPS", "Recharge", badge = "Upto 2%"),
+        ServiceItem("loan_repay", "Loan Repayment", "EMI & Loan Collection", Icons.Outlined.RequestQuote, "BANKING", "BBPS", "Recharge", badge = "Flat 0.15%"),
+        ServiceItem("electricity", "Electricity", "TNEB & State Electricity", Icons.Outlined.Lightbulb, "BANKING", "BBPS", "Recharge", badge = "Flat ₹1"),
+        ServiceItem("dth", "DTH", "DTH TV Recharge", Icons.Outlined.SettingsInputAntenna, "BANKING", "BBPS", "Recharge", badge = "Upto 1.50%"),
+        ServiceItem("agent_coll", "Agent Collection", "Field Collection Service", Icons.Outlined.Storefront, "BANKING", "BBPS", "Wallet", badge = "Flat 0.11%"),
+        ServiceItem("cc_bill", "Credit Card Bill", "BBPS Card Bill Pay", Icons.Outlined.CreditScore, "BANKING", "BBPS", "Recharge", badge = "Flat ₹0.5"),
+        ServiceItem("fastag", "FASTag", "Toll Tag Recharge", Icons.Outlined.DirectionsCar, "BANKING", "BBPS", "Recharge", badge = "Flat 0.15%"),
+        ServiceItem("postpaid", "Mobile Postpaid", "Postpaid Bill Payment", Icons.Outlined.PhoneAndroid, "BANKING", "BBPS", "Recharge")
     )
 
     LazyColumn(modifier = Modifier.fillMaxSize()) {
@@ -1027,7 +1028,7 @@ fun ServicesHomeScreen(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                if (isSyncing) "Syncing..." else "ID: $agentId",
+                                if (isSyncing) "Updating..." else "ID: $agentId",
                                 color = Color.White.copy(alpha = 0.85f),
                                 fontSize = 12.sp
                             )
@@ -1050,7 +1051,7 @@ fun ServicesHomeScreen(
                         IconButton(
                             onClick = {
                                 onServiceClick(
-                                    ServiceItem("add_wallet", "Add Money to Wallet", "Top-up Agent Wallet", Icons.Outlined.AddCard, "WALLET", "Wallet")
+                                    ServiceItem("add_wallet", "Add Money to Wallet", "Top-up Agent Wallet", Icons.Outlined.AddCard, "WALLET", "WALLET", "Wallet")
                                 )
                             },
                             modifier = Modifier
@@ -1079,7 +1080,7 @@ fun ServicesHomeScreen(
                         .fillMaxWidth()
                         .clickable {
                             onServiceClick(
-                                ServiceItem("buy_gold", "Digital Gold", "Buy 24K Gold via Oropocket", Icons.Outlined.Diamond, "OROPOCKET", "GOLD")
+                                ServiceItem("buy_gold", "Digital Gold", "Buy 24K Pure Digital Gold", Icons.Outlined.Diamond, "BULLION", "GOLD", "GOLD")
                             )
                         }
                 ) {
@@ -1089,7 +1090,7 @@ fun ServicesHomeScreen(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("24K Digital Gold (Oropocket)", color = Color(0xFFFFD54F), fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
+                            Text("24K Digital Gold", color = Color(0xFFFFD54F), fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
                             Text("Buy: ₹${"%.0f".format(goldRate.buyPrice)} | Sell: ₹${"%.0f".format(goldRate.sellPrice)}/gm", color = Color.White, fontSize = 12.sp)
                         }
                         Column(horizontalAlignment = Alignment.End) {
@@ -1102,7 +1103,7 @@ fun ServicesHomeScreen(
         }
 
         item {
-            ServiceGridCard("Banking & Gold Services", "Eko + Oropocket", bankingServices, 3, onServiceClick)
+            ServiceGridCard("Banking & Gold Services", "MiXCOM PAY", bankingServices, 3, onServiceClick)
         }
 
         item {
@@ -1160,7 +1161,7 @@ fun ServiceFullScreen(
                         shape = RoundedCornerShape(8.dp)
                     ) {
                         Text(
-                            service.provider,
+                            service.badgeLabel,
                             color = Color(0xFFFFD54F),
                             fontWeight = FontWeight.ExtraBold,
                             fontSize = 11.sp,
@@ -1193,7 +1194,7 @@ fun ServiceFullScreen(
                             Text("Available Wallet", color = Color.White.copy(alpha = 0.8f), fontSize = 12.sp)
                             Text("₹ ${"%.2f".format(currentBalance)}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
                         }
-                        if (service.provider == "OROPOCKET") {
+                        if (service.channelCode == "BULLION") {
                             Column(horizontalAlignment = Alignment.End) {
                                 Text("24K Rate", color = Color(0xFFFFD54F), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                 Text("₹${"%.2f".format(goldRate.finalBuyPrice)}/gm", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
@@ -1240,7 +1241,7 @@ fun ServiceFullScreen(
                                 enabled = !isProcessing,
                                 modifier = Modifier.fillMaxWidth()
                             )
-                        } else if (service.provider != "OROPOCKET" && service.id != "add_wallet") {
+                        } else if (service.channelCode != "BULLION" && service.id != "add_wallet") {
                             OutlinedTextField(
                                 value = refOrAccount,
                                 onValueChange = { refOrAccount = it },
@@ -1302,11 +1303,11 @@ fun ServiceFullScreen(
 
                                 isProcessing = true
                                 scope.launch {
-                                    var gatewayMsg = "Processed"
+                                    var gatewayMsg = "Processed successfully"
                                     var gatewayOk = true
                                     val resolvedCustomerId = if (mobileNumber.length == 10) mobileNumber else "9000000000"
 
-                                    if (service.provider == "EKO") {
+                                    if (service.channelCode == "BANKING") {
                                         val payload = JSONObject()
                                             .put("action", service.id)
                                             .put("customer_id", resolvedCustomerId)
@@ -1324,15 +1325,14 @@ fun ServiceFullScreen(
                                                     .put("piddata", "")
                                                     .put("amount", amt)
                                             )
-                                        val (ok, respJson) = SupabaseClient.callEdgeFunction("eko-service", payload)
+                                        val (ok, respJson) = MixcomBackend.invokeGateway("eko-service", payload)
                                         gatewayOk = ok
                                         gatewayMsg = respJson.optJSONObject("data")?.optString("message")
-                                            ?: respJson.optString("message", if (ok) "Eko Success" else "Eko Failed")
-                                    } else if (service.provider == "OROPOCKET") {
+                                            ?: respJson.optString("message", if (ok) "Completed" else "Action failed")
+                                    } else if (service.channelCode == "BULLION") {
                                         val oroAction = if (service.id == "sell_gold") "sell_gold" else "buy_gold"
                                         val payload = JSONObject()
                                             .put("action", oroAction)
-                                            .put("path", if (service.id == "sell_gold") "/sell" else "/buy")
                                             .put("method", "POST")
                                             .put(
                                                 "payload",
@@ -1341,17 +1341,18 @@ fun ServiceFullScreen(
                                                     .put("asset", "gold")
                                                     .put("mobile", resolvedCustomerId)
                                             )
-                                        val (ok, respJson) = SupabaseClient.callEdgeFunction("oropocket-gold", payload)
+                                        val (ok, respJson) = MixcomBackend.invokeGateway("oropocket-gold", payload)
                                         gatewayOk = ok
-                                        gatewayMsg = respJson.optJSONObject("data")?.optString("message")
-                                            ?: respJson.optString("message", if (ok) "Oropocket Success" else "Oropocket Failed")
+                                        gatewayMsg = respJson.optString("message")
+                                            .ifBlank { respJson.optJSONObject("data")?.optString("message") ?: "" }
+                                            .ifBlank { if (ok) "Gold order completed" else "Gold order failed" }
                                     }
 
                                     isProcessing = false
                                     lastGatewayResponse = gatewayMsg
                                     Toast.makeText(context, gatewayMsg, Toast.LENGTH_LONG).show()
 
-                                    if (gatewayOk || service.provider == "WALLET") {
+                                    if (gatewayOk || service.channelCode == "WALLET") {
                                         val subText = if (service.isAeps) {
                                             "Mob: $resolvedCustomerId | $gatewayMsg"
                                         } else {
@@ -1359,7 +1360,7 @@ fun ServiceFullScreen(
                                         }
                                         onTransactionSuccess(
                                             service,
-                                            "${service.title} | ${service.provider}",
+                                            "${service.title} | ${service.badgeLabel}",
                                             subText,
                                             amt,
                                             isCredit,
@@ -1391,7 +1392,7 @@ fun ServiceFullScreen(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            "Last Response: $lastGatewayResponse",
+                            "Status: $lastGatewayResponse",
                             color = Color(0xFF1B5E20),
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Medium,
@@ -1574,6 +1575,6 @@ fun HelpScreen() {
     Column(modifier = Modifier.fillMaxSize().padding(20.dp)) {
         Text("Help & Support", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = RoyalBlue)
         Spacer(Modifier.height(12.dp))
-        Text("Eko Banking/Recharge + Oropocket Digital Gold", color = Color.DarkGray)
+        Text("MiXCOM Banking, Recharges, Bills & 24K Digital Gold", color = Color.DarkGray)
     }
 }
